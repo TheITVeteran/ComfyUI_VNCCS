@@ -43,8 +43,27 @@ def test_registered_node_result_unwraps_comfy_node_output():
     assert _unwrap_node_result(output) is output.result[0]
 
 
-def test_chroma_key_exposes_sam3_recovery_checkbox():
+def test_chroma_key_defaults_match_balanced_profile_and_expose_sam3_checkbox():
     required = VNCCSChromaKey.INPUT_TYPES()["required"]
+    expected_defaults = {
+        "tolerance": 0.15,
+        "softness": 0.12,
+        "despill_strength": 0.65,
+        "edge_width": 3,
+        "matte_cleanup": 0.10,
+        "foreground_recover": 0.35,
+        "edge_decontaminate": 0.75,
+        "edge_choke": 0.08,
+        "matte_method": "guided_edge",
+        "output_mode": "straight_rgba",
+    }
+
+    actual_defaults = {
+        name: required[name][1]["default"]
+        for name in expected_defaults
+    }
+
+    assert actual_defaults == expected_defaults
     assert required["use_sam3_recovery_mask"][0] == "BOOLEAN"
     assert required["use_sam3_recovery_mask"][1]["default"] is False
 
@@ -137,6 +156,12 @@ def test_sam3_recovery_rejects_background_objects_without_clipping_kept_masks():
         torch.ones((2, 1, 6, 8), dtype=torch.float32),
         torch.ones((2, 6, 8, 1), dtype=torch.float32),
         torch.ones((1, 2, 6, 8), dtype=torch.float32),
+        torch.ones((1, 2, 1, 6, 8), dtype=torch.float32),
+        torch.ones((1, 1, 2, 1, 6, 8, 1), dtype=torch.float32),
+        torch.ones((6, 8, 2), dtype=torch.float32),
+        torch.ones((2, 8, 6), dtype=torch.float32),
+        torch.ones((1, 2, 1, 3, 4), dtype=torch.float32),
+        torch.ones((2, 3, 4, 1), dtype=torch.float32),
     ],
 )
 def test_sam3_recovery_normalizes_individual_object_mask_layouts(raw_masks):
@@ -149,6 +174,37 @@ def test_sam3_recovery_normalizes_individual_object_mask_layouts(raw_masks):
     )
 
     assert candidates.shape == (2, 6, 8)
+
+
+def test_sam3_recovery_preserves_candidates_across_arbitrary_wrapper_axes():
+    node = VNCCSChromaKey()
+    first = torch.full((6, 8), 0.25, dtype=torch.float32)
+    second = torch.full((6, 8), 0.75, dtype=torch.float32)
+    raw_masks = torch.stack((first, second), dim=0).reshape(1, 2, 1, 6, 8, 1)
+
+    candidates = node._sam3_recovery_candidates_from_result(
+        (torch.ones((1, 6, 8)), None, raw_masks, [], []),
+        target_hw=(6, 8),
+    )
+
+    assert candidates.shape == (2, 6, 8)
+    assert candidates[:, 0, 0].tolist() == pytest.approx([0.25, 0.75])
+
+
+def test_sam3_recovery_falls_back_to_combined_mask_for_uninterpretable_candidates(capsys):
+    node = VNCCSChromaKey()
+    combined = torch.full((1, 6, 8), 0.6, dtype=torch.float32)
+    invalid_candidates = torch.ones((7,), dtype=torch.float32)
+
+    candidates = node._sam3_recovery_candidates_from_result(
+        (combined, None, invalid_candidates, [], []),
+        target_hw=(6, 8),
+        stage="SAM3 fallback test",
+    )
+
+    assert candidates.shape == (1, 6, 8)
+    assert candidates[0, 0, 0].item() == pytest.approx(0.6)
+    assert "individual mask shape (7,)" in capsys.readouterr().out
 
 
 def test_sam3_recovery_supports_legacy_combined_mask_output():
@@ -288,16 +344,30 @@ def test_sam3_recovery_filter_and_erode_are_configurable():
     assert no_erode_rgba[3, 3, 0].item() == pytest.approx(1.0)
 
 
-def test_connected_key_fringe_suppression_is_not_used_by_chroma_key(monkeypatch):
+def test_chroma_key_clears_border_connected_shifted_screen_color():
     node = VNCCSChromaKey()
+    key_color = torch.tensor([0.31, 0.77, 0.56], dtype=torch.float32)
+    shifted_screen = torch.tensor([0.49, 0.75, 0.66], dtype=torch.float32)
+    foreground = torch.tensor([0.90, 0.25, 0.35], dtype=torch.float32)
+    image = key_color.expand(1, 40, 40, 3).clone()
+    image[:, :, 18:22, :] = shifted_screen
+    image[:, 14:26, 14:26, :] = foreground
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("connected fringe suppression must not run in base chroma key")
-
-    monkeypatch.setattr(node, "_suppress_connected_key_fringe", fail_if_called)
-    image = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
-    image[..., 1] = 1.0
-
+    _, low_tolerance_matte, _ = node.chroma_key(
+        image,
+        0.0,
+        0.16,
+        0.5,
+        3,
+        0.2,
+        0.35,
+        0.7,
+        0.2,
+        "guided_edge",
+        "green",
+        "straight_rgba",
+        False,
+    )
     rgba, matte, debug = node.chroma_key(
         image,
         0.2,
@@ -314,9 +384,364 @@ def test_connected_key_fringe_suppression_is_not_used_by_chroma_key(monkeypatch)
         False,
     )
 
-    assert rgba.shape == (1, 8, 8, 4)
-    assert matte.shape == (1, 8, 8)
-    assert debug.shape == (1, 8, 8, 3)
+    assert rgba.shape == (1, 40, 40, 4)
+    assert matte.shape == (1, 40, 40)
+    assert debug.shape == (1, 40, 40, 3)
+    assert low_tolerance_matte[0, 5, 19].item() > 0.5
+    assert matte[0, 5, 19].item() == pytest.approx(0.0)
+    assert matte[0, 20, 20].item() > 0.95
+
+
+def test_connected_screen_cleanup_requires_chroma_and_rgb_similarity():
+    node = VNCCSChromaKey()
+    key_color = torch.tensor([0.31, 0.77, 0.56], dtype=torch.float32)
+    image = key_color.expand(16, 16, 3).clone()
+    pale_foreground = torch.tensor([1.0, 0.80, 0.80], dtype=torch.float32)
+    image[:, 7:9, :] = pale_foreground
+    alpha = torch.full((16, 16), 0.4, dtype=torch.float32)
+    alpha[:, 7:9] = 1.0
+
+    cleaned = node._suppress_connected_key_fringe(
+        image=image,
+        alpha=alpha,
+        key_color=key_color,
+        tolerance=0.20,
+        softness=0.16,
+        amount=1.0,
+    )
+
+    assert cleaned[2, 2].item() == pytest.approx(0.0)
+    assert cleaned[2, 7].item() == pytest.approx(1.0)
+
+
+def test_connected_screen_cleanup_preserves_confident_same_hue_foreground():
+    node = VNCCSChromaKey()
+    key_color = torch.tensor([0.23, 0.44, 0.37], dtype=torch.float32)
+    image = key_color.expand(24, 24, 3).clone()
+    dark_same_hue_foreground = key_color * 0.45
+    image[:, 10:14] = dark_same_hue_foreground
+    alpha = torch.zeros((24, 24), dtype=torch.float32)
+    alpha[:, 10:14] = 1.0
+
+    cleaned = node._suppress_connected_key_fringe(
+        image=image,
+        alpha=alpha,
+        key_color=key_color,
+        tolerance=0.15,
+        softness=0.16,
+        amount=1.0,
+    )
+
+    assert cleaned[12, 12].item() == pytest.approx(1.0)
+
+
+def test_screen_cleanup_handles_dark_border_and_enclosed_background():
+    node = VNCCSChromaKey()
+    key_color = torch.tensor([0.30, 0.70, 0.60], dtype=torch.float32)
+    image = key_color.expand(32, 32, 3).clone()
+    alpha = torch.full((32, 32), 0.4, dtype=torch.float32)
+
+    dark_border = key_color * 0.3
+    image[:, -1] = dark_border
+    alpha[:, -1] = 0.5
+
+    foreground = torch.tensor([0.90, 0.20, 0.30], dtype=torch.float32)
+    image[9:23, 9:23] = foreground
+    alpha[9:23, 9:23] = 1.0
+    enclosed_screen = torch.tensor([0.38, 0.68, 0.61], dtype=torch.float32)
+    image[12:20, 12:20] = enclosed_screen
+    alpha[12:20, 12:20] = 0.2
+
+    cleaned = node._suppress_connected_key_fringe(
+        image=image,
+        alpha=alpha,
+        key_color=key_color,
+        tolerance=0.20,
+        softness=0.16,
+        amount=1.0,
+    )
+
+    assert cleaned[16, -1].item() == pytest.approx(0.0)
+    assert cleaned[16, 16].item() == pytest.approx(0.0)
+    assert cleaned[10, 10].item() == pytest.approx(1.0)
+
+
+def test_despill_strength_controls_edge_decontamination():
+    node = VNCCSChromaKey()
+    key_color = torch.tensor([0.05, 0.95, 0.10], dtype=torch.float32)
+    image = key_color.expand(32, 32, 3).clone()
+    image[8:24, 8:24] = torch.tensor([0.80, 0.15, 0.20])
+    image[8:24, 8] = torch.tensor([0.25, 0.75, 0.20])
+
+    outputs = []
+    for despill_strength in (0.0, 1.0):
+        rgba, _, _ = node._process_single(
+            image,
+            tolerance=0.15,
+            softness=0.16,
+            despill_strength=despill_strength,
+            edge_width=3,
+            matte_cleanup=0.20,
+            foreground_recover=0.0,
+            edge_decontaminate=0.70,
+            edge_choke=0.0,
+            matte_method="guided_edge",
+            screen_mode="green",
+            output_mode="straight_rgba",
+        )
+        outputs.append(rgba)
+
+    no_despill, full_despill = outputs
+    assert full_despill[12, 8, 1].item() < no_despill[12, 8, 1].item()
+    assert not torch.allclose(no_despill[..., :3], full_despill[..., :3])
+
+
+def test_edge_color_bleed_removes_hidden_key_color_without_changing_alpha():
+    node = VNCCSChromaKey()
+    key_color = torch.tensor([0.2, 0.8, 0.3], dtype=torch.float32)
+    foreground = torch.tensor([0.9, 0.2, 0.3], dtype=torch.float32)
+    image = key_color.expand(16, 16, 3).clone()
+    image[6:10, 6:10] = foreground
+    alpha = torch.zeros((16, 16), dtype=torch.float32)
+    alpha[6:10, 6:10] = 1.0
+    alpha[5:11, 5:11] = torch.maximum(alpha[5:11, 5:11], torch.full((6, 6), 0.5))
+    edge = torch.zeros_like(alpha)
+    edge[4:12, 4:12] = 1.0
+    original_alpha = alpha.clone()
+
+    cleaned = node._bleed_clean_edge_colors(
+        image=image,
+        alpha=alpha,
+        edge=edge,
+        key_color=key_color,
+        dominant_idx=1,
+        other_indices=[0, 2],
+        radius=3,
+        amount=1.0,
+    )
+
+    assert torch.equal(alpha, original_alpha)
+    assert cleaned[5, 7, 1].item() < image[5, 7, 1].item()
+    assert torch.allclose(cleaned[4, 7], foreground)
+    assert torch.allclose(cleaned[0, 0], key_color)
+
+
+@pytest.mark.parametrize(
+    ("key_rgb", "foreground_rgb", "screen_mix"),
+    [
+        ([0.23, 0.44, 0.37], [0.05, 0.05, 0.50], 0.10),  # Teal screen into blue foreground.
+        ([0.23, 0.44, 0.37], [0.05, 0.05, 0.50], 0.50),
+        ([0.08, 0.15, 0.95], [0.75, 0.08, 0.10], 0.10),  # Blue screen into red foreground.
+        ([0.08, 0.15, 0.95], [0.75, 0.08, 0.10], 0.50),
+        ([0.95, 0.12, 0.08], [0.08, 0.10, 0.75], 0.10),  # Red screen into blue foreground.
+        ([0.95, 0.12, 0.08], [0.08, 0.10, 0.75], 0.50),
+    ],
+)
+def test_edge_color_bleed_removes_full_rgb_key_contamination(key_rgb, foreground_rgb, screen_mix):
+    node = VNCCSChromaKey()
+    key_color = torch.tensor(key_rgb, dtype=torch.float32)
+    foreground = torch.tensor(foreground_rgb, dtype=torch.float32)
+    contaminated = foreground * (1.0 - screen_mix) + key_color * screen_mix
+    image = key_color.expand(16, 16, 3).clone()
+    image[5:11, 5:11] = contaminated
+    image[6:10, 6:10] = foreground
+    alpha = torch.zeros((16, 16), dtype=torch.float32)
+    alpha[5:11, 5:11] = 0.5
+    alpha[6:10, 6:10] = 1.0
+    edge = torch.zeros_like(alpha)
+    edge[4:12, 4:12] = 1.0
+    dominant_idx = int(torch.argmax(key_color).item())
+    other_indices = [index for index in range(3) if index != dominant_idx]
+
+    cleaned = node._bleed_clean_edge_colors(
+        image=image,
+        alpha=alpha,
+        edge=edge,
+        key_color=key_color,
+        dominant_idx=dominant_idx,
+        other_indices=other_indices,
+        radius=3,
+        amount=1.0,
+    )
+
+    before = torch.linalg.vector_norm(image[5, 7] - foreground)
+    after = torch.linalg.vector_norm(cleaned[5, 7] - foreground)
+    assert after.item() < before.item() * 0.1
+    assert torch.allclose(cleaned[5, 7], foreground, atol=1e-4)
+
+
+def test_edge_color_bleed_does_not_trust_high_alpha_fringe_as_foreground():
+    node = VNCCSChromaKey()
+    key_color = torch.tensor([0.10, 0.70, 0.35], dtype=torch.float32)
+    foreground = torch.tensor([0.08, 0.12, 0.72], dtype=torch.float32)
+    contaminated = foreground * 0.55 + key_color * 0.45
+    image = key_color.expand(32, 32, 3).clone()
+    image[6:26, 6:26] = foreground
+    image[6:26, 6] = contaminated
+    image[6:26, 25] = contaminated
+
+    alpha = torch.zeros((32, 32), dtype=torch.float32)
+    alpha[6:26, 6:26] = 1.0
+    # These pixels are visually blended even though guided refinement made
+    # their matte nearly opaque and placed them outside the hard edge band.
+    alpha[10:22, 6] = 0.985
+    edge = torch.zeros_like(alpha)
+    original_alpha = alpha.clone()
+
+    cleaned = node._bleed_clean_edge_colors(
+        image=image,
+        alpha=alpha,
+        edge=edge,
+        key_color=key_color,
+        dominant_idx=1,
+        other_indices=[0, 2],
+        radius=5,
+        amount=1.0,
+    )
+
+    assert torch.equal(alpha, original_alpha)
+    assert torch.allclose(cleaned[14, 6], foreground, atol=1e-4)
+
+
+def test_chroma_key_falls_back_when_sam3_nodes_are_unavailable(monkeypatch):
+    node = VNCCSChromaKey()
+    image = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
+    expected = (
+        torch.zeros((4, 4, 4), dtype=torch.float32),
+        torch.zeros((4, 4), dtype=torch.float32),
+        torch.zeros((4, 4, 3), dtype=torch.float32),
+    )
+
+    monkeypatch.setattr(
+        node,
+        "_chroma_key_with_sam3_recovery",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Required node 'easy sam3ModelLoader' is not available")),
+    )
+    monkeypatch.setattr(vnccs_utils.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(node, "_process_single", lambda *_args, **_kwargs: expected)
+
+    rgba, matte, debug = node.chroma_key(
+        image=image,
+        tolerance=0.15,
+        softness=0.12,
+        despill_strength=0.65,
+        edge_width=3,
+        matte_cleanup=0.1,
+        foreground_recover=0.35,
+        edge_decontaminate=0.75,
+        edge_choke=0.08,
+        matte_method="guided_edge",
+        screen_mode="auto",
+        output_mode="straight_rgba",
+        use_sam3_recovery_mask=True,
+    )
+
+    assert rgba.shape == (1, 4, 4, 4)
+    assert matte.shape == (1, 4, 4)
+    assert debug.shape == (1, 4, 4, 3)
+
+
+def test_chroma_key_never_calls_sam3_recovery_on_macos(monkeypatch):
+    node = VNCCSChromaKey()
+    image = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
+    expected = (
+        torch.zeros((4, 4, 4), dtype=torch.float32),
+        torch.zeros((4, 4), dtype=torch.float32),
+        torch.zeros((4, 4, 3), dtype=torch.float32),
+    )
+
+    monkeypatch.setattr(vnccs_utils.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        node,
+        "_chroma_key_with_sam3_recovery",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("SAM3 must be skipped on macOS")),
+    )
+    monkeypatch.setattr(node, "_process_single", lambda *_args, **_kwargs: expected)
+
+    rgba, matte, debug = node.chroma_key(
+        image=image,
+        tolerance=0.15,
+        softness=0.12,
+        despill_strength=0.65,
+        edge_width=3,
+        matte_cleanup=0.1,
+        foreground_recover=0.35,
+        edge_decontaminate=0.75,
+        edge_choke=0.08,
+        matte_method="guided_edge",
+        screen_mode="auto",
+        output_mode="straight_rgba",
+        use_sam3_recovery_mask=True,
+    )
+
+    assert rgba.shape == (1, 4, 4, 4)
+    assert matte.shape == (1, 4, 4)
+    assert debug.shape == (1, 4, 4, 3)
+
+
+@pytest.mark.parametrize("error", [ImportError("triton unavailable"), ValueError("unsupported device")])
+def test_chroma_key_falls_back_for_any_optional_sam3_failure(monkeypatch, error):
+    node = VNCCSChromaKey()
+    image = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
+    expected = (
+        torch.zeros((4, 4, 4), dtype=torch.float32),
+        torch.zeros((4, 4), dtype=torch.float32),
+        torch.zeros((4, 4, 3), dtype=torch.float32),
+    )
+
+    monkeypatch.setattr(vnccs_utils.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        node,
+        "_chroma_key_with_sam3_recovery",
+        lambda **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(node, "_process_single", lambda *_args, **_kwargs: expected)
+
+    result = node.chroma_key(
+        image=image,
+        tolerance=0.15,
+        softness=0.12,
+        despill_strength=0.65,
+        edge_width=3,
+        matte_cleanup=0.1,
+        foreground_recover=0.35,
+        edge_decontaminate=0.75,
+        edge_choke=0.08,
+        matte_method="guided_edge",
+        screen_mode="auto",
+        output_mode="straight_rgba",
+        use_sam3_recovery_mask=True,
+    )
+
+    assert tuple(tensor.shape for tensor in result) == ((1, 4, 4, 4), (1, 4, 4), (1, 4, 4, 3))
+
+
+def test_edge_color_bleed_uses_interior_anchor_for_opaque_boundary_spill():
+    node = VNCCSChromaKey()
+    key_color = torch.tensor([0.10, 0.70, 0.35], dtype=torch.float32)
+    foreground = torch.tensor([0.08, 0.12, 0.72], dtype=torch.float32)
+    contaminated = foreground * 0.55 + key_color * 0.45
+    image = key_color.expand(32, 32, 3).clone()
+    image[6:26, 6:26] = foreground
+    image[6:26, 6] = contaminated
+
+    alpha = torch.zeros((32, 32), dtype=torch.float32)
+    alpha[6:26, 6:26] = 1.0
+    edge = torch.zeros_like(alpha)
+    edge[6:26, 6] = 1.0
+
+    cleaned = node._bleed_clean_edge_colors(
+        image=image,
+        alpha=alpha,
+        edge=edge,
+        key_color=key_color,
+        dominant_idx=1,
+        other_indices=[0, 2],
+        radius=5,
+        amount=1.0,
+    )
+
+    assert torch.allclose(cleaned[14, 6], foreground, atol=1e-4)
 
 
 class TestClothesTemplates:
@@ -326,7 +751,7 @@ class TestClothesTemplates:
 
     def test_aesthetic_choices_include_all_and_json_values(self):
         choices = VNCCS_ClothesTemplates.INPUT_TYPES()["required"]["aesthetic"][0]
-        assert choices[0] == "ВСЕ"
+        assert choices[0] == "ALL"
         assert "Techwear" in choices
 
     def test_random_template_filters_by_aesthetic_and_explicit(self, monkeypatch):

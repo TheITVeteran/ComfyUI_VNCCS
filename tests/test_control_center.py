@@ -14,6 +14,10 @@ from nodes.vnccs_control_center import (
     _rel_within_folder,
     _find_model_on_disk,
     _resolve_model_download_path,
+    _control_center_data_path,
+    _create_download_staging_file,
+    _custom_nodes_roots,
+    _registered_node_class,
     _validate_downloaded_model_file,
     _validate_download_response,
     _validate_https_url,
@@ -32,6 +36,8 @@ from nodes.vnccs_control_center import (
     _load_gguf,
     VNCCSPipeProxy,
 )
+
+_CONTROL_CENTER_MODULE = sys.modules[_sync_packaged_cc_config.__module__]
 
 
 # ── _find_entry ───────────────────────────────────────────────────────────────
@@ -172,9 +178,93 @@ class TestDownloadSafety:
     def test_resolve_model_download_path_accepts_models_relative_path(self, tmp_path, monkeypatch):
         import folder_paths as fp
         monkeypatch.setattr(fp, "models_dir", str(tmp_path), raising=False)
+        monkeypatch.setattr(fp, "get_folder_paths", lambda key: [])
         path = _resolve_model_download_path("models/checkpoints/model.safetensors")
         assert path == os.path.join(str(tmp_path), "checkpoints", "model.safetensors")
 
+    def test_resolve_model_download_path_uses_configured_desktop_model_folder(self, tmp_path, monkeypatch):
+        import folder_paths as fp
+        shared_checkpoints = tmp_path / "shared-models" / "checkpoints"
+        monkeypatch.setattr(
+            fp,
+            "get_folder_paths",
+            lambda key: [str(shared_checkpoints)] if key == "checkpoints" else [],
+        )
+
+        path = _resolve_model_download_path("models/checkpoints/packs/model.safetensors")
+
+        assert path == os.path.join(str(shared_checkpoints), "packs", "model.safetensors")
+
+    def test_download_staging_file_is_hidden_and_beside_target(self, tmp_path):
+        target = tmp_path / "models" / "checkpoints" / "model.safetensors"
+        fd, staging_path = _create_download_staging_file(str(target), "cc_models_Test Model")
+        os.close(fd)
+        try:
+            assert os.path.dirname(staging_path) == str(target.parent)
+            assert os.path.basename(staging_path).startswith(".vnccs_ccmodelsTestModel_")
+            assert staging_path.endswith(".part")
+        finally:
+            os.unlink(staging_path)
+
+    def test_control_center_state_writes_to_user_directory(self, tmp_path, monkeypatch):
+        import folder_paths as fp
+        monkeypatch.setattr(fp, "get_user_directory", lambda: str(tmp_path), raising=False)
+
+        path = _control_center_data_path("vnccs_user_config.json", for_write=True)
+
+        assert path == os.path.join(str(tmp_path), "VNCCS", "vnccs_user_config.json")
+
+
+class TestModuleStatusHelpers:
+    def test_custom_node_roots_use_all_registered_paths(self, tmp_path, monkeypatch):
+        import folder_paths as fp
+        first = tmp_path / "desktop-custom-nodes"
+        second = tmp_path / "extra-custom-nodes"
+        monkeypatch.setattr(fp, "get_folder_paths", lambda key: [str(first), str(second), str(first)])
+
+        assert _custom_nodes_roots() == [str(first), str(second)]
+
+    def test_registered_node_class_ignores_unregistered_python_classes(self):
+        class FaceDetailer:
+            pass
+
+        spec = {"class_names": ["FaceDetailer"]}
+
+        assert _registered_node_class(spec, mappings={}) is None
+        assert _registered_node_class(spec, mappings={"FaceDetailer": FaceDetailer}) is FaceDetailer
+
+    def test_registered_node_class_supports_v3_node_id(self):
+        class EasySam3Loader:
+            pass
+
+        spec = {
+            "node_id": "easy sam3ModelLoader",
+            "class_names": ["LoadSam3Model"],
+        }
+
+        assert _registered_node_class(
+            spec,
+            mappings={"easy sam3ModelLoader": EasySam3Loader},
+        ) is EasySam3Loader
+
+    def test_dependency_status_exposes_registry_ids_for_manager_installation(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "nodes",
+            "vnccs_control_center.py",
+        )
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        assert '"manager_id": "ComfyUI-GGUF"' in source
+        assert '"manager_id": "comfyui-impact-pack"' in source
+        assert '"manager_id": "comfyui-impact-subpack"' in source
+        assert '"manager_id": "comfyui-easy-sam3"' in source
+        assert '"manager_version": "latest"' in source
+        assert '"darwin_compatibility_warning"' in source
+
+
+class TestDownloadedModelValidation:
     def test_validate_downloaded_model_rejects_html(self, tmp_path):
         f = tmp_path / "fake.safetensors"
         f.write_bytes(b"<html>" + b"x" * 2048)
@@ -333,10 +423,7 @@ class TestPackagedConfigSync:
     def test_updates_packaged_catalog_atomically(self, tmp_path, monkeypatch):
         target = tmp_path / "control_center.json"
         target.write_text('{"name": "old"}\n', encoding="utf-8")
-        monkeypatch.setattr(
-            "nodes.vnccs_control_center._get_packaged_cc_path",
-            lambda: str(target),
-        )
+        monkeypatch.setattr(_CONTROL_CENTER_MODULE, "_get_packaged_cc_path", lambda: str(target))
 
         updated = {
             "name": "current",
@@ -357,41 +444,46 @@ class TestPackagedConfigSync:
 
     def test_ignores_unrelated_repositories(self, tmp_path, monkeypatch):
         target = tmp_path / "control_center.json"
-        monkeypatch.setattr(
-            "nodes.vnccs_control_center._get_packaged_cc_path",
-            lambda: str(target),
-        )
+        monkeypatch.setattr(_CONTROL_CENTER_MODULE, "_get_packaged_cc_path", lambda: str(target))
 
         assert _sync_packaged_cc_config("someone/else", {"name": "remote"}) is False
         assert not target.exists()
 
-    def test_remote_config_refreshes_packaged_fallback(self, tmp_path, monkeypatch):
+    def test_remote_config_refresh_replaces_local_copy(self, tmp_path, monkeypatch):
         target = tmp_path / "control_center.json"
         remote = tmp_path / "remote_control_center.json"
-        target.write_text('{"name": "old"}\n', encoding="utf-8")
+        target.write_text(json.dumps({
+            "name": "old",
+            "lora": [{
+                "name": "VNCCS Pose Studio Klein9b",
+                "version": "3.0",
+                "kind": "Klein9b",
+            }],
+        }), encoding="utf-8")
         remote_data = {
             "name": "current",
             "models": [],
             "clip": [],
             "vae": [],
-            "lora": [],
+            "lora": [{
+                "name": "VNCCS Pose Studio Klein9b",
+                "version": "2.2",
+                "kind": "Klein9b",
+            }],
             "controlnet": [],
             "other": [],
         }
         remote.write_text(json.dumps(remote_data), encoding="utf-8")
 
-        monkeypatch.setattr(
-            "nodes.vnccs_control_center._get_packaged_cc_path",
-            lambda: str(target),
-        )
-        monkeypatch.setattr(
-            "nodes.vnccs_control_center.hf_hub_download",
-            lambda **kwargs: str(remote),
-        )
-        monkeypatch.setattr(
-            "nodes.vnccs_control_center._load_custom_loras",
-            lambda: [],
-        )
+        monkeypatch.setattr(_CONTROL_CENTER_MODULE, "_get_packaged_cc_path", lambda: str(target))
+        download_args = {}
+
+        def fake_hf_download(**kwargs):
+            download_args.update(kwargs)
+            return str(remote)
+
+        monkeypatch.setattr(_CONTROL_CENTER_MODULE, "hf_hub_download", fake_hf_download)
+        monkeypatch.setattr(_CONTROL_CENTER_MODULE, "_load_custom_loras", lambda: [])
         _CC_CONFIG_CACHE.clear()
 
         try:
@@ -400,7 +492,29 @@ class TestPackagedConfigSync:
             _CC_CONFIG_CACHE.clear()
 
         assert loaded["name"] == "current"
+        assert loaded["lora"][0]["version"] == "2.2"
         assert json.loads(target.read_text(encoding="utf-8")) == remote_data
+        assert download_args["force_download"] is True
+
+    def test_remote_refresh_failure_does_not_return_stale_local_config(self, tmp_path, monkeypatch):
+        target = tmp_path / "control_center.json"
+        local_data = {"name": "stale", "lora": [{"name": "Removed LoRA", "version": "3.0"}]}
+        target.write_text(json.dumps(local_data), encoding="utf-8")
+        monkeypatch.setattr(_CONTROL_CENTER_MODULE, "_get_packaged_cc_path", lambda: str(target))
+
+        def fail_hf_download(**kwargs):
+            raise RuntimeError("HF unavailable")
+
+        monkeypatch.setattr(_CONTROL_CENTER_MODULE, "hf_hub_download", fail_hf_download)
+        _CC_CONFIG_CACHE.clear()
+
+        try:
+            with pytest.raises(RuntimeError, match="HF unavailable"):
+                _get_cc_config("MIUProject/VNCCS_v3.0", prefer_remote=True)
+        finally:
+            _CC_CONFIG_CACHE.clear()
+
+        assert json.loads(target.read_text(encoding="utf-8")) == local_data
 
     def test_packaged_catalog_uses_current_clothes_core(self):
         path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "control_center.json")
@@ -416,6 +530,183 @@ class TestPackagedConfigSync:
         assert clothes_core["local_path"].endswith("VNCCS_QIE2511_ClothesCore-RC3.7.safetensors")
         assert all(entry["name"] != "VNCCS Emotion Core" for entry in config["lora"])
 
+    def test_packaged_catalog_contains_complete_klein_family(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "control_center.json")
+        with open(path, "r", encoding="utf-8") as handle:
+            config = _dedupe_config_by_name(json.load(handle))
+
+        klein_models = [entry for entry in config["models"] if entry.get("kind") == "Klein9b"]
+        klein_clips = [entry for entry in config["clip"] if entry.get("kind") == "Klein9b"]
+        klein_vaes = [entry for entry in config["vae"] if entry.get("kind") == "Klein9b"]
+        klein_loras = [entry for entry in config["lora"] if entry.get("kind") == "Klein9b"]
+
+        assert [entry["hf_path"] for entry in klein_models] == ["flux-2-klein-9b-fp8.safetensors"]
+        assert [entry["hf_repo"] for entry in klein_models] == ["MIUProject/FLUX.2-klein-9b-fp8"]
+        assert [entry["clip_type"] for entry in klein_clips] == ["flux2"]
+        assert [entry["hf_repo"] for entry in klein_clips] == [
+            "Comfy-Org/vae-text-encorder-for-flux-klein-9b"
+        ]
+        assert [entry["hf_path"] for entry in klein_clips] == [
+            "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors"
+        ]
+        assert [entry["hf_repo"] for entry in klein_vaes] == [
+            "Comfy-Org/vae-text-encorder-for-flux-klein-9b"
+        ]
+        assert [entry["hf_path"] for entry in klein_vaes] == [
+            "split_files/vae/flux2-vae.safetensors"
+        ]
+        assert [entry["local_path"] for entry in klein_vaes] == ["models/vae/flux2-vae.safetensors"]
+        assert {entry["type"] for entry in klein_loras} == {"Helper"}
+        assert {entry["name"] for entry in klein_loras} == {
+            "VNCCS Clothes Core Klein9b",
+            "VNCCS Pose Studio Klein9b",
+        }
+
+
+class TestControlCenterFamilyState:
+    def test_builds_klein_pipe_from_family_scoped_state(self, monkeypatch):
+        model = object()
+        clip = object()
+        vae = object()
+        model_entry = {"name": "Flux Klein 9B FP8", "type": "unet", "kind": "Klein9b"}
+        monkeypatch.setattr("nodes.vnccs_control_center._get_cc_config", lambda repo_id: {
+            "models": [model_entry],
+            "clip": [{"name": "klein_clip", "kind": "Klein9b"}],
+            "vae": [{"name": "klein_vae", "kind": "Klein9b"}],
+            "lora": [],
+        })
+        captured = {}
+
+        def fake_load_model_block(entry, selected_type, settings, config, clips, vae_name, **kwargs):
+            captured.update(entry=entry, selected_type=selected_type, clips=clips, vae_name=vae_name)
+            return model, clip, vae
+
+        monkeypatch.setattr("nodes.vnccs_control_center._load_model_block", fake_load_model_block)
+        monkeypatch.setattr("nodes.vnccs_control_center._apply_loras", lambda model, clip, *args, **kwargs: (model, clip))
+
+        pipe = _build_control_center_pipe("demo/repo", {
+            "active_kind": "Klein9b",
+            "selected_types_by_kind": {"QIE2511": "gguf", "Klein9b": "unet"},
+            "selected_models": {"Klein9b:unet": "Flux Klein 9B FP8"},
+            "model_params_by_kind": {
+                "QIE2511": {"steps": 8, "cfg": 2},
+                "Klein9b": {"steps": 4, "cfg": 1, "sampler": "euler", "scheduler": "simple"},
+            },
+        })
+
+        assert captured == {
+            "entry": model_entry,
+            "selected_type": "unet",
+            "clips": ["klein_clip"],
+            "vae_name": "klein_vae",
+        }
+        assert pipe.model_entry == model_entry
+        assert pipe.sample_steps == 4
+        assert pipe.cfg == 1.0
+        assert pipe.sampler_name == "euler"
+
+    def test_custom_klein_pipe_keeps_klein_model_context(self, monkeypatch):
+        custom_model = object()
+        custom_clip = object()
+        custom_vae = object()
+        qie_entry = {"name": "Qwen GGUF", "type": "gguf", "kind": "QIE2511"}
+        klein_entry = {"name": "Flux Klein 9B FP8", "type": "unet", "kind": "Klein9b"}
+        monkeypatch.setattr("nodes.vnccs_control_center._get_cc_config", lambda repo_id: {
+            "models": [qie_entry, klein_entry],
+            "clip": [],
+            "vae": [],
+            "lora": [],
+        })
+        captured = {}
+
+        def fake_load_model_block(entry, selected_type, *args, **kwargs):
+            captured.update(entry=entry, selected_type=selected_type)
+            return kwargs["custom_model"], kwargs["custom_clip"], kwargs["custom_vae"]
+
+        monkeypatch.setattr("nodes.vnccs_control_center._load_model_block", fake_load_model_block)
+        monkeypatch.setattr("nodes.vnccs_control_center._apply_loras", lambda model, clip, *args, **kwargs: (model, clip))
+
+        pipe = _build_control_center_pipe(
+            "demo/repo",
+            {
+                "active_kind": "Klein9b",
+                "selected_types_by_kind": {"Klein9b": "custom"},
+                "selected_models": {"Klein9b:unet": "Flux Klein 9B FP8"},
+                "model_params_by_kind": {"Klein9b": {"steps": 4, "cfg": 1}},
+            },
+            custom_model=custom_model,
+            custom_clip=custom_clip,
+            custom_vae=custom_vae,
+        )
+
+        assert captured == {"entry": klein_entry, "selected_type": "custom"}
+        assert pipe.model_entry == klein_entry
+
+
+class TestControlCenterFrontendFamilies:
+    def test_frontend_has_family_tabs_and_kind_filters(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "vnccs_control_center.js")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        assert '{ kind: "QIE2511", label: "QIE2511", defaultType: "gguf" }' in source
+        assert '{ kind: "Klein9b", label: "Flux Klein9b", defaultType: "unet" }' in source
+        assert 'activeKind === "Klein9b" ? ["unet", "custom"]' in source
+        assert 'const contextType = this._familyDefinition().defaultType;' in source
+        assert '.vnccs-cc-twocol-left > .vnccs-cc-model-card' in source
+        assert 'this.scrollArea.appendChild(this._renderFamilyTabs())' in source
+        assert "_exactKind(entry, kind = this._selectedKind())" in source
+        assert "entryKind && kind && entryKind.toLowerCase() === kind.toLowerCase()" in source
+        assert "!entry.custom && !this._isTurboLora(entry) && this._exactKind(entry, selectedKind)" in source
+        assert "if (!this._exactKind(entry, selectedKind)) continue;" in source
+        assert "(this._isHelperLora(entry) || this._sameKind(entry, selectedKind))" not in source
+
+    def test_download_errors_are_visible_to_desktop_users(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "vnccs_control_center.js")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        download_source = source.split("async _downloadEntry(cat, entry)", 1)[1].split(
+            "async _downloadAllMissing()", 1
+        )[0]
+        assert "if (!r.ok || d.error)" in download_source
+        assert "this.showMessage(message, true);" in download_source
+        assert "detail: { repo_id: repoId }" in download_source
+
+    def test_missing_dependencies_install_through_comfyui_manager(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "vnccs_control_center.js")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        assert 'api.fetchApi("/v2/manager/queue/task"' in source
+        assert 'api.fetchApi("/v2/manager/queue/start"' in source
+        assert 'api.fetchApi("/v2/manager/queue/batch"' in source
+        assert 'api.addEventListener("cm-task-completed"' in source
+        assert 'api.fetchApi("/v2/manager/reboot"' in source
+        assert 'selected_version: "latest"' in source
+        assert 'kind: "install"' in source
+        assert "skip_post_install: false" in source
+        assert 'this._btn("Install all"' in source
+        assert 'this._btn("Restart server"' in source
+        assert "this._dependencyRestartRequired && this._dependencyInstallTasks.size === 0" in source
+        assert 'info.status === "unsupported"' in source
+        assert 'info.status !== "unsupported"' in source
+        assert "git clone" not in source.split("async _queueDependencyInstall", 1)[1].split(
+            "_handleManagerTaskCompleted", 1
+        )[0]
+
+    def test_custom_model_inputs_follow_the_active_custom_tab(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web", "vnccs_control_center.js")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        sync_source = source.split("_syncCustomModelInput()", 1)[1].split("_setSelectedType", 1)[0]
+        assert "this.config ? this._getSelectedType() : this._getStoredSelectedType()" in sync_source
+        assert 'const isCustom = selectedType === "custom"' in sync_source
+        assert 'sync("model", "MODEL"' in sync_source
+        assert 'sync("clip", "CLIP"' in sync_source
+        assert 'sync("vae", "VAE"' in sync_source
+        assert source.count("this._syncCustomModelInput();") >= 7
 
 class TestClothesPreviewFrontendContract:
     def test_custom_preview_uses_partial_graph_execution(self):
@@ -507,7 +798,7 @@ class TestCustomLoraHelpers:
         saved = {}
 
         monkeypatch.setattr("nodes.vnccs_control_center._load_custom_loras", lambda: stored)
-        monkeypatch.setattr("nodes.vnccs_control_center._get_custom_loras_path", lambda: "/tmp/vnccs_custom_loras.json")
+        monkeypatch.setattr("nodes.vnccs_control_center._get_custom_loras_path", lambda *args, **kwargs: "/tmp/vnccs_custom_loras.json")
         monkeypatch.setattr("nodes.vnccs_control_center.os.makedirs", lambda *args, **kwargs: None)
 
         class _FakeFile:

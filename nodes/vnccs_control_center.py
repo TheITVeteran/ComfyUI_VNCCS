@@ -8,8 +8,9 @@ import time
 import urllib.parse
 import inspect
 import ipaddress
-import sys
 import re
+import platform
+import tempfile
 
 import folder_paths
 import comfy.sd
@@ -70,7 +71,12 @@ _DOWNLOAD_STATUS = {}
 _DOWNLOAD_QUEUE = queue.Queue()
 _CUSTOM_LORAS_FILE = "vnccs_custom_loras.json"
 _PACKAGED_CC_REPO_IDS = {"MIUProject/VNCCS_v3.0"}
-_PIPELINE_LOCAL_LORAS = {"vnccs clothes core", "vnccs pose studio qie2511"}
+_PIPELINE_LOCAL_LORAS = {
+    "vnccs clothes core",
+    "vnccs pose studio qie2511",
+    "vnccs clothes core klein9b",
+    "vnccs pose studio klein9b",
+}
 _FOLDER_MAP = {
     "unet": ["unet", "diffusion_models"],
     "checkpoints": ["checkpoints"],
@@ -194,8 +200,84 @@ def resolve_path(relative_path):
     return os.path.abspath(os.path.join(base, normalized))
 
 
+def _control_center_data_path(filename, for_write=False):
+    """Resolve mutable Control Center state outside the ComfyUI code directory."""
+    get_user_directory = getattr(folder_paths, "get_user_directory", None)
+    if callable(get_user_directory):
+        try:
+            user_directory = get_user_directory()
+        except Exception:
+            user_directory = ""
+        if user_directory:
+            current = os.path.abspath(os.path.join(user_directory, "VNCCS", filename))
+            if for_write or os.path.exists(current):
+                return current
+
+    # Preserve configs created by older VNCCS releases and portable installs.
+    return resolve_path(filename)
+
+
 def _models_root():
     return os.path.abspath(getattr(folder_paths, "models_dir", os.path.join(getattr(folder_paths, "base_path", os.getcwd()), "models")))
+
+
+def _configured_model_folder(folder_type):
+    """Return ComfyUI's preferred folder for a catalog model category."""
+    for key in _FOLDER_MAP.get(folder_type, [folder_type]):
+        try:
+            paths = folder_paths.get_folder_paths(key) or []
+        except Exception:
+            paths = []
+        if paths:
+            return os.path.abspath(normalize_filesystem_path(paths[0]))
+    return os.path.join(_models_root(), folder_type)
+
+
+def _create_download_staging_file(target_path, model_key):
+    """Create a hidden partial file beside the target for an atomic final move."""
+    target_directory = os.path.dirname(target_path)
+    os.makedirs(target_directory, exist_ok=True)
+    sanitized_name = "".join(ch for ch in model_key if ch.isalnum()) or "model"
+    return tempfile.mkstemp(
+        prefix=f".vnccs_{sanitized_name}_",
+        suffix=".part",
+        dir=target_directory,
+    )
+
+
+def _custom_nodes_roots():
+    """Return every custom-node root registered with the running ComfyUI host."""
+    try:
+        roots = folder_paths.get_folder_paths("custom_nodes") or []
+    except Exception:
+        roots = []
+    if not roots:
+        roots = [os.path.join(getattr(folder_paths, "base_path", os.getcwd()), "custom_nodes")]
+
+    result = []
+    seen = set()
+    for root in roots:
+        normalized = os.path.abspath(normalize_filesystem_path(root))
+        key = os.path.normcase(normalized)
+        if key not in seen:
+            seen.add(key)
+            result.append(normalized)
+    return result
+
+
+def _registered_node_class(spec, mappings=None):
+    """Find a dependency only in ComfyUI's active node registry."""
+    mappings = mappings if mappings is not None else _get_node_class_mappings()
+    identifiers = [spec.get("node_id"), *spec.get("class_names", [])]
+    for identifier in identifiers:
+        if identifier and identifier in mappings:
+            return mappings[identifier]
+
+    class_names = set(spec.get("class_names", []))
+    for candidate in mappings.values():
+        if getattr(candidate, "__name__", None) in class_names:
+            return candidate
+    return None
 
 
 def _validate_https_url(url):
@@ -256,8 +338,9 @@ def _resolve_model_download_path(local_path):
     if folder_type not in _FOLDER_MAP:
         raise ValueError(f"Unsupported model folder '{folder_type}'")
     _validate_model_filename(parts[-1])
-    target = os.path.abspath(os.path.join(_models_root(), *parts[1:]))
-    if os.path.commonpath([_models_root(), target]) != _models_root():
+    target_root = _configured_model_folder(folder_type)
+    target = os.path.abspath(os.path.join(target_root, *parts[2:]))
+    if os.path.commonpath([target_root, target]) != target_root:
         raise ValueError("Model local_path escapes ComfyUI models directory")
     return target
 
@@ -301,7 +384,7 @@ def _validate_downloaded_model_file(path, expected_name="model"):
 
 
 def get_vnccs_config():
-    config_path = resolve_path("vnccs_user_config.json")
+    config_path = _control_center_data_path("vnccs_user_config.json")
     if not os.path.exists(config_path):
         return {}
     try:
@@ -312,15 +395,16 @@ def get_vnccs_config():
 
 
 def save_vnccs_config(new_data):
-    config_path = resolve_path("vnccs_user_config.json")
+    config_path = _control_center_data_path("vnccs_user_config.json", for_write=True)
     data = get_vnccs_config()
     data.update(new_data)
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
 
 
-def _get_custom_loras_path():
-    return resolve_path(_CUSTOM_LORAS_FILE)
+def _get_custom_loras_path(for_write=False):
+    return _control_center_data_path(_CUSTOM_LORAS_FILE, for_write=for_write)
 
 
 def _load_custom_loras():
@@ -338,7 +422,7 @@ def _load_custom_loras():
 
 
 def _save_custom_loras(entries):
-    path = _get_custom_loras_path()
+    path = _get_custom_loras_path(for_write=True)
     current = _load_custom_loras()
     by_path = {
         entry.get("local_path", "").replace("\\", "/"): entry
@@ -377,7 +461,7 @@ def _remove_custom_lora(local_path=None, name=None):
         kept.append(entry)
 
     payload = {"lora": kept}
-    path = _get_custom_loras_path()
+    path = _get_custom_loras_path(for_write=True)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -446,7 +530,7 @@ def _merge_custom_loras(config):
 
 
 def get_installed_version_info():
-    registry_path = resolve_path("vnccs_installed_models.json")
+    registry_path = _control_center_data_path("vnccs_installed_models.json")
     if not os.path.exists(registry_path):
         return {}
     try:
@@ -457,9 +541,10 @@ def get_installed_version_info():
 
 
 def update_installed_version(model_name, version):
-    registry_path = resolve_path("vnccs_installed_models.json")
+    registry_path = _control_center_data_path("vnccs_installed_models.json", for_write=True)
     data = get_installed_version_info()
     data[model_name] = version
+    os.makedirs(os.path.dirname(registry_path), exist_ok=True)
     with open(registry_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
 
@@ -496,7 +581,7 @@ def _sync_packaged_cc_config(repo_id, data):
                 json.dump(data, handle, indent=2, ensure_ascii=False)
                 handle.write("\n")
             os.replace(tmp_path, target)
-            print(f"[VNCCS Control Center] Updated packaged catalog from '{repo_id}'.")
+            print(f"[VNCCS Control Center] Replaced local catalog from '{repo_id}'.")
             return True
     except Exception as exc:
         print(f"[VNCCS Control Center] Failed to update packaged catalog: {exc}")
@@ -521,20 +606,14 @@ def _get_cc_config(repo_id, prefer_remote=False):
     else:
         user_config = get_vnccs_config()
         hf_token = user_config.get("hf_token")
-        try:
-            path = hf_hub_download(
-                repo_id=repo_id,
-                filename="control_center.json",
-                local_files_only=False,
-                force_download=bool(prefer_remote),
-                token=hf_token,
-            )
-            source = "huggingface"
-        except Exception:
-            if not _uses_packaged_cc_config(repo_id):
-                raise
-            path = _get_packaged_cc_path()
-            source = "packaged"
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename="control_center.json",
+            local_files_only=False,
+            force_download=bool(prefer_remote),
+            token=hf_token,
+        )
+        source = "huggingface"
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     if source == "huggingface":
@@ -636,10 +715,11 @@ def _find_first_entry_by_type(entries, entry_type):
     return None
 
 
-def _selected_model_name_for_type(state, entry_type):
+def _selected_model_name_for_type(state, entry_type, kind=""):
     selected_models = state.get("selected_models", {}) if isinstance(state, dict) else {}
     if isinstance(selected_models, dict):
-        name = selected_models.get(entry_type)
+        name = selected_models.get(f"{kind}:{entry_type}") if kind else None
+        name = name or selected_models.get(entry_type)
         if name:
             return name
     return ""
@@ -647,8 +727,21 @@ def _selected_model_name_for_type(state, entry_type):
 
 def _custom_context_model_entry(config, state):
     models = config.get("models", []) if isinstance(config, dict) else []
-    name = _selected_model_name_for_type(state, "gguf") or state.get("selected_model", "")
-    return _find_entry(models, name) or _find_first_entry_by_type(models, "gguf")
+    active_kind = str(state.get("active_kind", "") or "").strip()
+    normalized_kind = _normalize_meta_value(active_kind)
+    context_type = "unet" if normalized_kind == "klein9b" else "gguf"
+    name = _selected_model_name_for_type(state, context_type, active_kind) or state.get("selected_model", "")
+    selected = _find_entry(models, name)
+    if selected and (not normalized_kind or _entry_kind(selected) == normalized_kind):
+        return selected
+    return next(
+        (
+            entry for entry in models
+            if _entry_type(entry) == context_type
+            and (not normalized_kind or _entry_kind(entry) == normalized_kind)
+        ),
+        _find_first_entry_by_type(models, context_type),
+    )
 
 
 def _rel_within_folder(local_path):
@@ -1165,6 +1258,7 @@ def _download_worker_loop():
 
         try:
             _DOWNLOAD_STATUS[model_key] = {"status": "downloading", "message": "Initializing..."}
+            target_abs_path = _resolve_model_download_path(target_model["local_path"])
             url = ""
             headers = {}
 
@@ -1196,12 +1290,9 @@ def _download_worker_loop():
             expected_name = basename_agnostic(target_model.get("local_path", "") or target_model.get("hf_path", "") or "model")
             total_size, max_bytes = _validate_download_response(response, expected_name)
             downloaded = 0
-            temp_dir = os.path.join(folder_paths.base_path, "temp")
-            os.makedirs(temp_dir, exist_ok=True)
-            sanitized_name = "".join(ch for ch in model_key if ch.isalnum())
-            temp_path = os.path.join(temp_dir, f"vnccs_{sanitized_name}.tmp")
+            temp_fd, temp_path = _create_download_staging_file(target_abs_path, model_key)
 
-            with open(temp_path, "wb") as handle:
+            with os.fdopen(temp_fd, "wb") as handle:
                 for chunk in response.iter_content(chunk_size=8192):
                     if not chunk:
                         continue
@@ -1225,14 +1316,9 @@ def _download_worker_loop():
                         }
 
             _DOWNLOAD_STATUS[model_key]["message"] = "Validating..."
-            target_abs_path = _resolve_model_download_path(target_model["local_path"])
             _validate_downloaded_model_file(temp_path, os.path.basename(target_abs_path))
             _DOWNLOAD_STATUS[model_key]["message"] = "Installing..."
-            os.makedirs(os.path.dirname(target_abs_path), exist_ok=True)
-
-            import shutil
-
-            shutil.move(temp_path, target_abs_path)
+            os.replace(temp_path, target_abs_path)
             update_installed_version(model_key, target_model.get("version", ""))
             _DOWNLOAD_STATUS[model_key] = {"status": "success", "message": "Installed"}
         except Exception as exc:
@@ -1254,6 +1340,7 @@ def _download_worker_loop():
                 message = "File not found (404)"
 
             _DOWNLOAD_STATUS[model_key] = {"status": status, "message": message}
+            print(f"[VNCCS Control Center] Download failed for '{model_key}': {message}")
         finally:
             _DOWNLOAD_QUEUE.task_done()
 
@@ -1324,11 +1411,21 @@ def _build_control_center_pipe(repo_id, node_state, custom_model=None, custom_cl
     except Exception:
         state = {}
 
+    active_kind = str(state.get("active_kind", "") or "").strip()
     selected_type = state.get("selected_type", "")
+    selected_types_by_kind = state.get("selected_types_by_kind", {})
+    if active_kind and isinstance(selected_types_by_kind, dict):
+        selected_type = selected_types_by_kind.get(active_kind, selected_type)
     selected_model = state.get("selected_model", "")
+    selected_models = state.get("selected_models", {})
+    if active_kind and isinstance(selected_models, dict):
+        selected_model = selected_models.get(f"{active_kind}:{selected_type}", selected_model)
     loras = state.get("loras", [])
     type_settings = state.get("type_settings", {})
     model_params = state.get("model_params", {})
+    model_params_by_kind = state.get("model_params_by_kind", {})
+    if active_kind and isinstance(model_params_by_kind, dict):
+        model_params = model_params_by_kind.get(active_kind, model_params)
 
     config = _apply_active_installed_paths(_get_cc_config(repo_id))
     if selected_type == "custom":
@@ -1708,25 +1805,16 @@ async def save_api_token(request):
 async def vnccs_module_status(request):
     import re
 
-    custom_nodes_dir = os.path.join(folder_paths.base_path, "custom_nodes")
+    custom_nodes_roots = _custom_nodes_roots()
     modules = {
         "main": ["vnccs", "ComfyUI_VNCCS"],
         "utils": ["vnccs-utils", "ComfyUI_VNCCS_Utils"],
     }
     dependency_modules = {
-        "seedvr": {
-            "label": "SeedVR",
-            "github_url": "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler",
-            "folders": ["seedvr2_videoupscaler", "ComfyUI-SeedVR2_VideoUpscaler", "comfyui-seedvr2-videoupscaler", "ComfyUI-SeedVR"],
-            "nodes": [
-                {"class_names": ["SeedVR2LoadDiTModel"]},
-                {"class_names": ["SeedVR2LoadVAEModel"]},
-                {"class_names": ["SeedVR2VideoUpscaler"]},
-            ],
-        },
         "gguf": {
             "label": "GGUF",
             "github_url": "https://github.com/city96/ComfyUI-GGUF",
+            "manager_id": "ComfyUI-GGUF",
             "folders": ["ComfyUI-GGUF"],
             "loader_check": "gguf",
             "nodes": [
@@ -1736,6 +1824,7 @@ async def vnccs_module_status(request):
         "impact_pack": {
             "label": "Impact Pack",
             "github_url": "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
+            "manager_id": "comfyui-impact-pack",
             "folders": ["ComfyUI-Impact-Pack"],
             "nodes": [
                 {"class_names": ["SAMLoader"]},
@@ -1745,6 +1834,7 @@ async def vnccs_module_status(request):
         "impact_subpack": {
             "label": "Impact Subpack",
             "github_url": "https://github.com/ltdrdata/ComfyUI-Impact-Subpack",
+            "manager_id": "comfyui-impact-subpack",
             "folders": ["ComfyUI-Impact-Subpack"],
             "nodes": [
                 {"class_names": ["UltralyticsDetectorProvider"]},
@@ -1753,6 +1843,8 @@ async def vnccs_module_status(request):
         "easy_sam3": {
             "label": "Easy SAM3",
             "github_url": "https://github.com/yolain/ComfyUI-Easy-Sam3",
+            "manager_id": "comfyui-easy-sam3",
+            "darwin_compatibility_warning": "The current Easy SAM3 release requires decord and Triton. Neither supports the macOS/MPS Desktop runtime, so installation or import may fail until the upstream package adds macOS support.",
             "folders": ["ComfyUI-Easy-Sam3", "comfyui-easy-sam3"],
             "nodes": [
                 {"node_id": "easy sam3ModelLoader", "class_names": ["LoadSam3Model"]},
@@ -1774,43 +1866,21 @@ async def vnccs_module_status(request):
             return None
 
     def comfy_node_available(spec):
-        mappings = _get_node_class_mappings()
-        node_id = spec.get("node_id")
-        if node_id and node_id in mappings:
-            return True
-
-        for class_name in spec.get("class_names", []):
-            if class_name in mappings:
-                return True
-
-        for module in list(sys.modules.values()):
-            if module is None:
-                continue
-            for class_name in spec.get("class_names", []):
-                if getattr(module, class_name, None) is not None:
-                    return True
-            if node_id:
-                try:
-                    values = vars(module).values()
-                except Exception:
-                    continue
-                for candidate in values:
-                    if not inspect.isclass(candidate) or not hasattr(candidate, "define_schema"):
-                        continue
-                    try:
-                        schema = candidate.define_schema()
-                        if getattr(schema, "node_id", None) == node_id:
-                            return True
-                    except Exception:
-                        continue
-        return False
+        return _registered_node_class(spec) is not None
 
     def dependency_status(spec):
+        is_darwin = platform.system().lower() == "darwin"
+        manager_metadata = {
+            "manager_id": spec.get("manager_id"),
+            "manager_version": "latest",
+            "compatibility_note": spec.get("darwin_compatibility_warning") if is_darwin else None,
+        }
         folders = []
-        for folder in spec.get("folders", []):
-            path = os.path.join(custom_nodes_dir, folder)
-            if os.path.isdir(path):
-                folders.append(folder)
+        for root in custom_nodes_roots:
+            for folder in spec.get("folders", []):
+                path = os.path.join(root, folder)
+                if os.path.isdir(path) and folder not in folders:
+                    folders.append(folder)
 
         missing_nodes = []
         for node_spec in spec.get("nodes", []):
@@ -1826,6 +1896,7 @@ async def vnccs_module_status(request):
                     return {
                         "label": spec["label"],
                         "github_url": spec.get("github_url"),
+                        **manager_metadata,
                         "status": "warning",
                         "folder": folders[0] if folders else loader_info.get("folder"),
                         "missing_nodes": [],
@@ -1835,6 +1906,7 @@ async def vnccs_module_status(request):
             return {
                 "label": spec["label"],
                 "github_url": spec.get("github_url"),
+                **manager_metadata,
                 "status": "ok",
                 "folder": folders[0] if folders else None,
                 "missing_nodes": [],
@@ -1843,7 +1915,8 @@ async def vnccs_module_status(request):
         return {
             "label": spec["label"],
             "github_url": spec.get("github_url"),
-            "status": "partial" if folders else "missing",
+            **manager_metadata,
+            "status": "unsupported" if manager_metadata.get("compatibility_note") else ("partial" if folders else "missing"),
             "folder": folders[0] if folders else None,
             "missing_nodes": missing_nodes,
         }
@@ -1851,10 +1924,14 @@ async def vnccs_module_status(request):
     result = {}
     for key, name_variants in modules.items():
         found = []
-        for name in name_variants:
-            path = os.path.join(custom_nodes_dir, name)
-            if os.path.isdir(path):
-                found.append({"folder": name, "version": read_version(path)})
+        found_paths = set()
+        for root in custom_nodes_roots:
+            for name in name_variants:
+                path = os.path.join(root, name)
+                normalized_path = os.path.normcase(os.path.abspath(path))
+                if os.path.isdir(path) and normalized_path not in found_paths:
+                    found_paths.add(normalized_path)
+                    found.append({"folder": name, "version": read_version(path)})
 
         if not found:
             result[key] = {"error": "not_found"}

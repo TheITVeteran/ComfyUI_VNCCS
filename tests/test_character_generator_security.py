@@ -13,6 +13,61 @@ pytest.importorskip("torch")
 from nodes import character_generator as cg
 
 
+def test_chroma_key_presets_use_edge_safe_tolerance_scale():
+    tolerances = {
+        name: values["tolerance"]
+        for name, values in cg.CHROMA_KEY_PRESETS.items()
+    }
+
+    assert tolerances == {
+        "ultra_light": 0.00,
+        "light": 0.10,
+        "balanced": 0.15,
+        "strong": 0.18,
+        "aggressive": 0.22,
+    }
+    assert cg.DEFAULT_WIDGET_DATA["bg_remove"]["tolerance"] == 0.15
+    assert cg.CHROMA_KEY_PRESETS["balanced"] == {
+        "tolerance": 0.15,
+        "softness": 0.12,
+        "despill_strength": 0.65,
+        "edge_width": 3,
+        "matte_cleanup": 0.10,
+        "foreground_recover": 0.35,
+        "edge_decontaminate": 0.75,
+        "edge_choke": 0.08,
+        "matte_method": "guided_edge",
+        "output_mode": "straight_rgba",
+    }
+
+
+def test_klein_pipe_selects_klein_encoder_and_helper_loras(monkeypatch):
+    generator = cg.VNCCS_CharacterGenerator()
+    pipe_values = {
+        "clip": object(),
+        "vae": object(),
+        "model_entry": {"name": "Flux Klein 9B FP8", "kind": "Klein9b"},
+    }
+    pipe = type("Pipe", (), {
+        "model_entry": pipe_values["model_entry"],
+        "lora_entries": [
+            {"name": "VNCCS Pose Studio QIE2511", "kind": "QIE2511"},
+            {"name": "VNCCS Pose Studio Klein9b", "kind": "Klein9b"},
+            {"name": "VNCCS Clothes Core", "kind": "QIE2511"},
+            {"name": "VNCCS Clothes Core Klein9b", "kind": "Klein9b"},
+        ],
+        "lora_states": [],
+    })()
+    calls = []
+    monkeypatch.setattr(cg, "_call_comfy_node", lambda class_name, **kwargs: calls.append((class_name, kwargs)) or (1, 2, 3))
+
+    assert generator._encoder_call(pipe_values, "prompt", image1=object()) == (1, 2, 3)
+    assert calls[0][0] == "VNCCS_Flux_Klein_Encoder"
+    assert calls[0][1]["megapixels"] == 1.0
+    assert generator._find_pose_lora(pipe)["name"] == "VNCCS Pose Studio Klein9b"
+    assert generator._find_clothes_lora(pipe)["name"] == "VNCCS Clothes Core Klein9b"
+
+
 def test_character_root_ignores_external_sheets_path(tmp_path, monkeypatch):
     base = tmp_path / "output" / "VNCCS" / "Characters"
     char_root = base / "Alice"
@@ -186,6 +241,7 @@ def test_bg_remove_uses_sam3_details_recovery_by_default(monkeypatch):
 
     class CapturingChromaKey:
         def chroma_key(self, *args, **kwargs):
+            seen["tolerance"] = args[1]
             seen["use_sam3_recovery_mask"] = args[12]
             return (args[0], None, None)
 
@@ -198,7 +254,10 @@ def test_bg_remove_uses_sam3_details_recovery_by_default(monkeypatch):
         background="Green",
     )
 
-    assert seen["use_sam3_recovery_mask"] is True
+    assert seen == {
+        "tolerance": 0.15,
+        "use_sam3_recovery_mask": True,
+    }
 
 
 def test_bg_remove_can_disable_sam3_details_recovery(monkeypatch):
@@ -838,6 +897,8 @@ def test_seedvr_loader_cleans_vram_and_uses_settings(monkeypatch):
 
     def fake_call(class_name, **kwargs):
         calls.append((class_name, kwargs))
+        if class_name == "SeedVR2Conditioning":
+            return ("positive", "negative")
         return (f"{class_name}_out",)
 
     monkeypatch.setattr(cg, "_call_comfy_node", fake_call)
@@ -845,7 +906,7 @@ def test_seedvr_loader_cleans_vram_and_uses_settings(monkeypatch):
     settings = cg.VNCCS_CharacterGenerator()._settings("{}")["upscaler"]
     settings.update(
         {
-            "model": "custom_dit.gguf",
+            "model": "custom_dit.safetensors",
             "vae": "custom_vae.safetensors",
             "offload_device": "cpu",
             "cache_dit": True,
@@ -862,60 +923,59 @@ def test_seedvr_loader_cleans_vram_and_uses_settings(monkeypatch):
 
     assert fake_mm.unloaded == 1
     assert fake_mm.emptied == 1
-    assert calls[0][0] == "SeedVR2LoadDiTModel"
-    assert calls[0][1]["model"] == "custom_dit.gguf"
-    assert calls[0][1]["cache_model"] is True
-    assert calls[1][0] == "SeedVR2LoadVAEModel"
-    assert calls[1][1]["model"] == "custom_vae.safetensors"
-    assert calls[2][0] == "SeedVR2VideoUpscaler"
-    assert calls[2][1]["resolution"] == 4096
-    assert calls[2][1]["max_resolution"] == 3840
-    assert calls[2][1]["color_correction"] == "adain"
-    assert calls[2][1]["offload_device"] == "cpu"
+    assert calls[0][0] == "UNETLoader"
+    assert calls[0][1]["unet_name"] == "custom_dit.safetensors"
+    assert calls[1][0] == "VAELoader"
+    assert calls[1][1]["vae_name"] == "custom_vae.safetensors"
+    assert [name for name, _ in calls[2:]] == [
+        "ImageScale", "SeedVR2Preprocess", "VAEEncodeTiled", "SeedVR2Conditioning",
+        "KSampler", "VAEDecodeTiled", "SeedVR2PostProcessing",
+    ]
+    assert calls[2][1]["width"] == 1610
+    assert calls[2][1]["height"] == 3840
+    assert calls[4][1]["tile_size"] == 1024
+    assert calls[4][1]["overlap"] == 128
+    assert calls[7][1]["tile_size"] == 1024
+    assert calls[7][1]["overlap"] == 128
+    assert calls[-1][1]["color_correction_method"] == "adain"
 
 
-def test_seedvr_dit_cache_setting_is_not_force_overridden(monkeypatch):
-    calls = []
-
-    monkeypatch.setattr(cg.VNCCS_CharacterGenerator, "_clean_vram_for_seedvr", lambda self: None)
-    monkeypatch.setattr(
-        cg,
-        "_call_comfy_node",
-        lambda class_name, **kwargs: calls.append((class_name, kwargs)) or (object(),),
-    )
-    settings = cg.VNCCS_CharacterGenerator()._settings(
-        json.dumps({"upscaler": {"cache_dit": False}})
-    )["upscaler"]
-
-    cg.VNCCS_CharacterGenerator()._run_upscaler_models(settings)
-
-    assert calls[0][0] == "SeedVR2LoadDiTModel"
-    assert calls[0][1]["cache_model"] is False
-
-
-def test_upscaler_can_use_local_seed_instead_of_pipe_seed():
+def test_seedvr_target_dimensions_use_short_edge_and_max_edge():
+    torch = pytest.importorskip("torch")
     generator = cg.VNCCS_CharacterGenerator()
 
-    assert generator._upscaler_seed(
-        {"inherit_pipe_seed": False, "seed": 1234},
-        pipe_seed=99,
-    ) == 1234
-    assert generator._upscaler_seed(
-        {"inherit_pipe_seed": True, "seed": 1234},
-        pipe_seed=99,
-    ) == 99
+    assert generator._seedvr_target_dimensions(
+        torch.rand(1, 1024, 1024, 3),
+        {"resolution": 2048, "max_resolution": 3840},
+    ) == (2048, 2048)
+    assert generator._seedvr_target_dimensions(
+        torch.rand(1, 1584, 664, 3),
+        {"resolution": 2048, "max_resolution": 3840},
+    ) == (1610, 3840)
 
 
-def test_seedvr_upscaler_runs_whole_batch_once(monkeypatch):
+def test_seedvr_loader_ensures_required_vae_on_process(monkeypatch):
+    ensured = []
+    monkeypatch.setattr(cg, "_ensure_seedvr_vae_model", lambda name: ensured.append(name))
+    monkeypatch.setattr(cg, "_call_comfy_node", lambda class_name, **kwargs: (object(),))
+    monkeypatch.setattr(cg.VNCCS_CharacterGenerator, "_clean_vram_for_seedvr", lambda self: None)
+
+    settings = cg.VNCCS_CharacterGenerator()._settings("{}")['upscaler']
+    cg.VNCCS_CharacterGenerator()._run_upscaler_models(settings)
+
+    assert ensured == ["ema_vae_fp16.safetensors"]
+
+
+def test_seedvr_upscaler_runs_each_image_independently(monkeypatch):
     torch = pytest.importorskip("torch")
     generator = cg.VNCCS_CharacterGenerator()
     calls = []
 
     monkeypatch.setattr(generator, "_run_upscaler_models", lambda settings: ("dit", "vae"))
 
-    def fake_seedvr(image, dit, vae, settings, seed):
+    def fake_seedvr(image, dit, vae, settings, seed, node_id=None):
         calls.append(image)
-        assert image.shape == (4, 1584, 664, 3)
+        assert image.shape == (1, 1584, 664, 3)
         return image
 
     monkeypatch.setattr(generator, "_run_seedvr_upscale_one", fake_seedvr)
@@ -929,8 +989,21 @@ def test_seedvr_upscaler_runs_whole_batch_once(monkeypatch):
         use_internal_rmbg=False,
     )
 
-    assert len(calls) == 1
+    assert len(calls) == 4
     assert result.shape == images.shape
+
+
+def test_upscaler_can_use_local_seed_instead_of_pipe_seed():
+    generator = cg.VNCCS_CharacterGenerator()
+
+    assert generator._upscaler_seed(
+        {"inherit_pipe_seed": False, "seed": 1234},
+        pipe_seed=99,
+    ) == 1234
+    assert generator._upscaler_seed(
+        {"inherit_pipe_seed": True, "seed": 1234},
+        pipe_seed=99,
+    ) == 99
 
 
 def test_seedvr_attention_auto_detects_until_manual(monkeypatch):
